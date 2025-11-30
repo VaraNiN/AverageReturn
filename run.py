@@ -5,6 +5,11 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
 
+# ===================== USER SETTINGS =====================
+# ticker accepts either a stock ticker symbol (for yfinance) or a path to a CSV file
+# csv files in the data directory were dowloaded from https://curvo.eu/backtest/en
+# .pkl files in the cache directory were downloaded via yfinance
+
 #ticker = "^GSPC"    # S&P 500 index (much longer, WARNING: does not include dividends)
 #ticker = "^SP500TR"  # S&P 500 index including reinvested dividends (total return)
 #ticker = "^GDAXI"   # DAX index including reinvested dividends (total return)
@@ -15,10 +20,28 @@ plot_name = "" # Optional; sets custom name in plot title when not empty
 scramble_years = True # Pick random years (True: Standard Bootstrap) instead of sequential years (False: Block Bootstrap)
 scramble_iteration = 1e5  # Number of iterations for Standard Bootstrap
 use_replace = True  # Whether to pick years with replacement (only for Standard Bootstrap): Some debate, but usually done with replacement
+random_seed = None  # Random seed for reproducibility (None for random, or any integer like 42)
+
+# =================== END USER SETTINGS ===================
+
+# ============ Disclaimer / Haftungsausschluss ============
+# I make no warranty as to the accuracy of the data shown. It's best to verify the calculations yourself.
+# Use of this calculator is at your own risk.
+# Investments involve risks, including the risk of capital loss.
+# This calculator does not constitute financial advice and I am not a financial advisor.
+# I accept no liability for losses or damages arising from the use of this program.
+
+# Ich übernehme keine Gewähr auf die Richtigkeit der gezeigten Daten. Am besten selber nochmal nachrechnen.
+# Die Nutzung dieses Rechners folgt auf eigene Verantwortung.
+# Investitionen sind mit Risiken verbunden, einschließlich des Risikos von Kapitalverlusten.
+# Dieser Rechner stellt keine Finanzberatung dar und ich bin kein Finanzberater.
+# Ich übernehme keine Haftung für Verluste oder Schäden, die aus der Nutzung dieses Programms entstehen.
 
 
 plot_name = plot_name if plot_name else ticker
 scramble_iteration = int(scramble_iteration)
+if random_seed is not None:
+    np.random.seed(random_seed)
 
 class StockDataFetcher:
     def __init__(self, ticker="^GSPC", cache_dir="cache"):
