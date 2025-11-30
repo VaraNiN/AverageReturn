@@ -4,6 +4,10 @@ import pickle
 from pathlib import Path
 from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
+from multiprocessing import Pool, Manager
+import os
+import psutil
+import time
 
 # ===================== USER SETTINGS =====================
 # ticker accepts either a stock ticker symbol (for yfinance) or a path to a CSV file
@@ -16,12 +20,19 @@ import matplotlib.pyplot as plt
 ticker = "data/msci_world_curvo.csv"  # CSV file (needs Date column + price column)
 duration_years = 15 # Number of years for each return period
 bin_width = 1.0  # Width of histogram bins in percentage points (e.g., 1.0 = 1% bins)
-plot_name = "" # Optional; sets custom name in plot title when not empty
+plot_name = "MSCI World" # Optional; sets custom name in plot title when not empty
 
-scramble_years = True # Pick random years (True: Standard Bootstrap) instead of sequential years (False: Block Bootstrap)
-scramble_iteration = 1e5  # Number of iterations for Standard Bootstrap
+block_bootstrap = True # True: Standard Bootstrap (sample randomly); False: Block Bootstrap (sequential years)
+bootstrap_samples = 5e8  # Number of samples for Standard Bootstrap (5e8 is approximate maximum for 32GB RAM)
 use_replace = True  # Whether to pick years with replacement (only for Standard Bootstrap): Some debate, but usually done with replacement
-random_seed = None  # Random seed for reproducibility (None for random, or any integer like 42)
+
+percentiles = [1, 10, 25, 50, 75, 90, 99]  # Percentiles to show as lines on the histogram (e.g., [1, 10, 50, 90, 99])
+probability_thresholds = [0.0, 2.5, 7.0, 10.0, 15.0, 20.0]  # Show probability of returns ≥ these values (in % p.a.)
+probability_losses = [0, 10, 20, 33, 50, 67, 80, 90]  # Show probability of losses after specified years (in % of initial investment)
+
+random_seed = None  # Random seed for reproducibility (None for random)
+num_threads = None  # Number of threads to use for parallel processing (None = use all available CPUs)
+chunk_size = 1e5    # Uses chunking for performance optimization; WARNING: DON'T SET THIS TOO LARGE! My system crashed at 1e7.
 
 # =================== END USER SETTINGS ===================
 
@@ -43,7 +54,8 @@ random_seed = None  # Random seed for reproducibility (None for random, or any i
 
 
 plot_name = plot_name if plot_name else ticker
-scramble_iteration = int(scramble_iteration)
+bootstrap_samples = int(bootstrap_samples)
+chunk_size = int(chunk_size)
 if random_seed is not None:
     np.random.seed(random_seed)
 
@@ -295,7 +307,6 @@ def calculate_annual_returns(data):
     yearly_prices = []
     for year_offset in range(total_years + 1):
         target_date = start_date + timedelta(days=365.25 * year_offset)
-        print(target_date)
         actual_date = get_closest_date(data, target_date)
         price = float(data.loc[actual_date, close_col])
         yearly_prices.append(price)
@@ -360,100 +371,291 @@ def calculate_period_returns(data, duration_years):
     return returns
 
 
-def calculate_scrambled_returns(data, duration_years, iterations):
-    """Run multiple iterations by randomly picking duration_years from annual returns."""
-    import pandas as pd
+def _worker_sample_returns(args):
+    """Worker function for parallel sampling of returns (vectorized in chunks).
+    Returns only the annualized returns as a 1D array to minimize memory transfer."""
+    annual_returns, num_years, duration_years, use_replace, n_samples, seed_offset, progress_queue = args
     
-    print(f"\n=== Running {iterations} scrambled iterations ===")
+    # Set random seed for this worker 
+    if random_seed is not None:
+        # Use a combination of base seed, worker ID, and large prime to ensure different sequences
+        np.random.seed((random_seed + seed_offset * 982451653) % (2**32))
+    else:
+        np.random.seed(None)
+    
+    # Convert to numpy array for faster indexing
+    annual_returns_array = np.array(annual_returns)
+    
+    # Process in chunks and only keep annualized returns
+    all_annualized_returns = np.empty(n_samples, dtype=np.float64)
+    
+    for chunk_start in range(0, n_samples, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, n_samples)
+        chunk_n_samples = chunk_end - chunk_start
+        
+        # Generate random indices for this chunk
+        random_indices = np.random.choice(num_years, size=(chunk_n_samples, duration_years), replace=use_replace)
+        
+        # Get all window returns for this chunk
+        window_returns = annual_returns_array[random_indices]  # Shape: (chunk_n_samples, duration_years)
+        
+        # Calculate cumulative returns for all samples in this chunk
+        cumulative_returns = np.prod(1 + window_returns, axis=1)  # Shape: (chunk_n_samples,)
+        
+        # Calculate annualized returns and store in pre-allocated array
+        all_annualized_returns[chunk_start:chunk_end] = cumulative_returns ** (1 / duration_years) - 1
+        
+        # Update progress for this chunk
+        if progress_queue is not None:
+            progress_queue.put(chunk_n_samples)
+    
+    # Return only the annualized returns array (much smaller than full dict structure)
+    return all_annualized_returns
+
+
+def calculate_scrambled_returns(data, duration_years, bootstrap_samples):
+    """Run multiple samples by randomly picking duration_years from annual returns."""
+    
+    print(f"\n=== Picking {bootstrap_samples:,} samples ===")
     
     # Calculate annual returns once
     annual_returns = calculate_annual_returns(data)
     num_years = len(annual_returns)
     
-    all_returns = []
+    # Determine number of threads
+    n_threads = num_threads if num_threads is not None else os.cpu_count()
+    print(f"Using {n_threads}/{os.cpu_count()} threads for parallel processing")
     
-    for iteration in range(iterations):
-        if (iteration + 1) % 1000 == 0:
-            print(f"Completed {iteration + 1:,}/{iterations:,} iterations...")
-        
-        # Randomly pick duration_years returns from annual_returns (each year only once)
-        random_indices = np.random.choice(num_years, size=duration_years, replace=use_replace)
-        window_returns = [annual_returns[i] for i in random_indices]
-        
-        # Calculate cumulative return
-        cumulative_return = 1.0
-        for ret in window_returns:
-            cumulative_return *= (1 + ret)
-        
-        total_return = cumulative_return - 1
-        annualized_return = (1 + total_return) ** (1 / duration_years) - 1
-        
-        all_returns.append({
-            'period': len(all_returns) + 1,
-            'start_date': None,  # Not meaningful for scrambled data
-            'end_date': None,
-            'start_price': None,
-            'end_price': None,
-            'total_return': total_return,
-            'return': annualized_return,
-            'years': duration_years
-        })
+    # Split work among threads
+    samples_per_thread = bootstrap_samples // n_threads
+    remainder = bootstrap_samples % n_threads
     
-    print(f"✓ Completed all {iterations} iterations")
-    print(f"Total periods analyzed: {len(all_returns)}")
+    # Create shared progress queue
+    with Manager() as manager:
+        progress_queue = manager.Queue()
+        
+        # Prepare arguments for each worker
+        worker_args = []
+        for i in range(n_threads):
+            n_samples = samples_per_thread + (1 if i < remainder else 0)
+            worker_args.append((annual_returns, num_years, duration_years, use_replace, n_samples, i, progress_queue))
+        
+        # Run workers in parallel with progress monitoring
+        start_time = time.time()
+        completed = 0
+        bar_length = 40
+        
+        with Pool(processes=n_threads) as pool:
+            # Start async processing
+            async_result = pool.map_async(_worker_sample_returns, worker_args)
+            
+            # Monitor progress while workers are running
+            while not async_result.ready():
+                # Check for progress updates
+                while not progress_queue.empty():
+                    try:
+                        completed += progress_queue.get_nowait()
+                    except:
+                        break
+                
+                percent = (completed / bootstrap_samples) * 100
+                elapsed = time.time() - start_time
+                rate = completed / elapsed if elapsed > 0 else 0
+                eta = (bootstrap_samples - completed) / rate if rate > 0 else 0
+                
+                # Progress bar
+                filled = int(bar_length * completed / bootstrap_samples)
+                bar = '█' * filled + '░' * (bar_length - filled)
+                
+                print(f'\r[{bar}] {percent:.1f}% ({completed:,}/{bootstrap_samples:,}) - '
+                      f'{rate:.0f} samples/s - ETA: {eta:.0f}s', end='', flush=True)
+                
+                time.sleep(0.1)
+            
+            # Get results (list of numpy arrays, one per worker)
+            worker_return_arrays = async_result.get()
+            
+            # Process any remaining progress updates
+            while not progress_queue.empty():
+                try:
+                    completed += progress_queue.get_nowait()
+                except:
+                    break
+            
+            # Final progress update
+            elapsed = time.time() - start_time
+            print(f'\r[{"█" * bar_length}] 100.0% ({bootstrap_samples:,}/{bootstrap_samples:,}) - '
+                  f'Completed in {elapsed:.1f}s ({int(bootstrap_samples/elapsed):,} samples/s)')
+        
+        # Concatenate all worker results into single array
+        all_annualized_returns = np.concatenate(worker_return_arrays)
     
-    return all_returns
+    print(f"Total periods analyzed: {len(all_annualized_returns):,}")
+    
+    # Return numpy array directly instead of converting to dicts
+    # This saves huge amount of memory for large sample sizes
+    return all_annualized_returns
 
 
-def plot_returns_histogram(returns, duration_years, ticker, best_period, worst_period, overall_return, scrambled=False, first_date=None, last_date=None):
-    """Create a histogram of returns with percentile lines."""
-    returns_array = np.array([r['return'] * 100 for r in returns])
+def plot_returns_histogram(returns_array, duration_years, ticker, best_period, worst_period, overall_return, scrambled=False, first_date=None, last_date=None):
+    """Create a histogram of returns with percentile lines.
     
-    # Calculate percentiles
-    percentiles = {
-        '1st': np.percentile(returns_array, 1),
-        '10th': np.percentile(returns_array, 10),
-        '25th': np.percentile(returns_array, 25),
-        '50th (Median)': np.percentile(returns_array, 50),
-        '75th': np.percentile(returns_array, 75),
-        '90th': np.percentile(returns_array, 90),
-        '99th': np.percentile(returns_array, 99)
-    }
+    Parameters:
+    -----------
+    returns_array : numpy.ndarray
+        Array of annualized returns (not percentages)
+    """
+    print(f"\n=== Plotting Histogram ===")
+    # Convert to percentage
+    returns_array = returns_array * 100
+    n = len(returns_array)
+    # Sort in advance for later calculations
+    print("Sorting returns...")
+    
+    # Check available memory before attempting parallel sort
+    available_memory = psutil.virtual_memory().available
+    array_size = returns_array.nbytes
+    n_chunks = num_threads if num_threads is not None else os.cpu_count()
+    
+    # Estimate memory needed for parallel sort (chunks + sorted_chunks + concatenation + final sort)
+    estimated_memory_needed = array_size * 4  # Conservative estimate
+    use_max_available = 0.75  # Use up to 75% of available memory
+    
+    if estimated_memory_needed < available_memory * use_max_available:
+        try:
+            print(f"Available memory: {available_memory / 1e9:.1f} GB, estimated need: {estimated_memory_needed / 1e9:.1f} GB")
+            print("Using parallel sorting...")
+            # Split array into chunks and sort in parallel
+            chunk_size = n // n_chunks
+            chunks = [returns_array[i*chunk_size:(i+1)*chunk_size] for i in range(n_chunks-1)]
+            chunks.append(returns_array[(n_chunks-1)*chunk_size:])  # Last chunk gets remainder
+            
+            with Pool(processes=num_threads) as pool:
+                sorted_chunks = pool.map(np.sort, chunks)
+            print("Parallel sorting completed.")
+            # Merge sorted chunks (k-way merge)
+            print("Merging sorted chunks...")
+            sorted_returns = np.concatenate(sorted_chunks)
+            sorted_returns.sort(kind='mergesort')  # Final merge sort is faster on partially sorted data
+        except Exception as e:
+            print(f"Parallel sorting failed ({e}), falling back to standard sort...")
+            sorted_returns = np.sort(returns_array)
+    else:
+        try:
+            print(f"Insufficient memory for parallel sort. Available: {available_memory / 1e9:.1f} GB, needed: {estimated_memory_needed * (2 - use_max_available) / 1e9:.1f} GB")
+            print("Using single-threaded sort...")
+            sorted_returns = np.sort(returns_array) # Have to use slower sorting for extremely large arrays due to memory constraints
+        except Exception as e:
+            print(f"Sorting failed: {e}")
+            exit(1)
+    
+    # Calculate percentiles using sorted array
+    percentile_values = {}
+    for p in percentiles:
+        if p == 1:
+            label = '1st'
+        elif p == 2:
+            label = '2nd'
+        else:
+            label = f'{p}th' if p != 50 else '50th (Median)'
+        percentile_values[label] = sorted_returns[int(n * p / 100)]
+    
+    # Calculate plot limits based on 0.01st and 99.99th percentiles
+    lower_limit = sorted_returns[int(n * 0.0001)] - 1
+    upper_limit = sorted_returns[int(n * 0.9999)] + 1
     
     plt.figure(figsize=(14, 8))
-    bins = np.arange(np.floor(returns_array.min()), np.ceil(returns_array.max()) + bin_width, bin_width)
-    plt.hist(returns_array, bins=bins, alpha=0.7, color='steelblue', edgecolor='black', density=True)
+    bins = np.arange(np.floor(sorted_returns[0]) - bin_width / 2., np.ceil(sorted_returns[-1]) + bin_width / 2., bin_width)
     
-    # Add percentile lines
-    colors = {'1st': 'darkred', '10th': 'red', '25th': 'orange', '50th (Median)': 'green', 
-              '75th': 'orange', '90th': 'red', '99th': 'darkred'}
-    line_styles = {'1st': ':', '10th': '--', '25th': '--', '50th (Median)': '-', 
-                   '75th': '--', '90th': '--', '99th': ':'}
+    # Precompute histogram with numpy (much faster than letting matplotlib do it)
+    print("Computing histogram...")
+    hist_counts, bin_edges = np.histogram(sorted_returns, bins=bins, density=True)
     
-    for label, value in percentiles.items():
-        plt.axvline(value, color=colors[label], linestyle=line_styles[label], 
-                   linewidth=2, label=f'{label}: {value:.1f}% p.a.')
+    # Plot using bar chart instead of hist (since we already computed the histogram)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    plt.bar(bin_centers, hist_counts, width=bin_width, alpha=0.7, color='steelblue', edgecolor='black')
+    
+    # Set x-axis limits to 0.01st and 99.99th percentiles +/- 1
+    plt.xlim(lower_limit, upper_limit)
+    
+    # Add percentile lines with dynamic colors based on extremity
+    for label, value in percentile_values.items():
+        # Extract numeric percentile value from label (handles '1st', '2nd', '50th (Median)', etc.)
+        p_value = int(label.split('st')[0]) if 'st' in label else int(label.split('nd')[0]) if 'nd' in label else int(label.split('th')[0])
+        
+        # Determine color and line style based on percentile value
+        if p_value <= 1 or p_value >= 99:
+            color = 'darkred'
+            linestyle = ':'
+        elif p_value <= 10 or p_value >= 90:
+            color = 'red'
+            linestyle = '--'
+        elif p_value <= 25 or p_value >= 75:
+            color = 'orange'
+            linestyle = '--'
+        elif p_value == 50:
+            color = 'green'
+            linestyle = '-'
+        else:
+            color = 'blue'
+            linestyle = '--'
+        
+        plt.axvline(value, color=color, linestyle=linestyle, 
+                   linewidth=2, label=f'{label}: {value:.2f}% p.a.')
     
     # Add overall period return line
     #plt.axvline(overall_return * 100, color='blue', linestyle=':', 
     #           linewidth=3, label=f'Overall: {overall_return*100:.1f}% p.a.')
     
-    plt.xlabel('Annualized Return (% p.a.)', fontsize=12)
+    plt.xlabel('Annualized Nominal Return (% p.a.)', fontsize=12)
     plt.ylabel('Probability (%)', fontsize=12)
     
     # Format y-axis as percentage (density * bin_width gives probability)
     ax = plt.gca()
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f'{y*bin_width*100:.1f}'))
     
-    method_text = f"{scramble_iteration:_}".replace("_", " ") + " iterations" if scramble_years else "Historical Sequenence"
+    method_text = f"{bootstrap_samples:_}".replace("_", " ") + " samples" if block_bootstrap else "Historical Sequenence"
     date_range = f" data from {first_date.strftime('%Y-%m-%d')} to {last_date.strftime('%Y-%m-%d')}" if first_date and last_date else ""
     plt.title(f'Distribution of Annualized Returns in {duration_years}-Year Windows ({method_text})\n{plot_name}{date_range}', 
               fontsize=14, fontweight='bold')
     plt.legend(loc='upper left', fontsize=10, title='Percentiles', title_fontsize=11)
     plt.grid(axis='y', alpha=0.3)
     
-    # Calculate standard deviation
+    # Calculate standard deviation and probability thresholds
     std_dev = np.std(returns_array)
+    
+    # Calculate probabilities for user-defined thresholds
+    prob_lines = ["\nSome probabilities for:\n"]
+
+    for threshold in probability_thresholds:
+        prob = np.sum(returns_array >= threshold) / len(returns_array) * 100
+        if prob > 0.1:
+          prob_lines.append(f'At least {threshold}%p.a.: {prob:.2f}%')
+        else:
+          count = np.sum(returns_array >= threshold)
+          if count == 0:
+            continue
+          else:
+            one_in_x = len(returns_array) / count
+            prob_lines.append(f'At least {threshold}%p.a.: 1 in {one_in_x:,.0f}')
+
+    prob_lines.append('')
+    for loss in probability_losses:
+        threshold = ((1 - loss/100)**(1/duration_years) - 1) * 100
+        count = np.sum(returns_array <= threshold)
+        prob = count / len(returns_array) * 100
+        if loss != 0:
+          if prob > 0.1:
+            prob_lines.append(f'At least {loss:.0f}% loss: {prob:.2f}%')
+          else:
+            if count == 0:
+              continue
+            else:
+              one_in_x = len(returns_array) / count
+              prob_lines.append(f'At least {loss:.0f}% loss: 1 in {one_in_x:,.0f}')
+        else:
+          prob_lines.append(f'No loss: {(100-prob):.2f}%')
+          prob_lines.append(f'Any loss: {(prob):.2f}%')
     
     # Add text box with best and worst periods and standard deviation
     if best_period["start_date"] is not None:
@@ -463,26 +665,42 @@ def plot_returns_histogram(returns, duration_years, ticker, best_period, worst_p
                    f'Worst Period:\n'
                    f'{worst_period["start_date"].strftime("%Y-%m-%d")} to {worst_period["end_date"].strftime("%Y-%m-%d")}\n'
                    f'Return: {worst_period["return"]*100:.2f}% p.a.\n\n'
-                   f'Standard Deviation: {std_dev:.2f}% p.a.')
+                   f'Standard Deviation: {std_dev:.2f}% p.a.\n\n' +
+                   '\n'.join(prob_lines))
     else:
         textstr = (f'Best Period:\n'
                    f'Return: {best_period["return"]*100:.2f}% p.a.\n\n'
                    f'Worst Period:\n'
                    f'Return: {worst_period["return"]*100:.2f}% p.a.\n\n'
-                   f'Standard Deviation: {std_dev:.2f}% p.a.')
+                   f'Standard Deviation: {std_dev:.2f}% p.a.\n\n' +
+                   '\n'.join(prob_lines))
     
     props = dict(boxstyle='round', facecolor='wheat', alpha=0.8)
-    plt.text(0.98, 0.97, textstr, transform=plt.gca().transAxes, fontsize=9,
+    plt.text(0.98, 0.97, textstr, transform=plt.gca().transAxes, fontsize=11,
              verticalalignment='top', horizontalalignment='right', bbox=props)
     
     plt.tight_layout()
     plt.savefig(f'returns_histogram_{plot_name.replace("^","").replace("/","_")}_{duration_years}yr.png', dpi=300)
-    plt.show()
     
     return percentiles
 
 
+def show_plot_with_timer(start_time):
+    """Show plot and print total execution time."""
+    total_time = time.time() - start_time
+    hours = int(total_time // 3600)
+    minutes = int((total_time % 3600) // 60)
+    seconds = total_time % 60
+    print(f"\n{'='*60}")
+    print(f"Total program execution time: {hours} hours, {minutes} minutes, {seconds:.3f} seconds")
+    print(f"{'='*60}")
+    plt.show()
+
+
 def main():
+    # Start timer for total program execution
+    program_start_time = time.time()
+    
     # Fetch all available data for the specified ticker
     print(f"\n=== Fetching {ticker} Data ===")
     fetcher = StockDataFetcher(ticker=ticker)
@@ -509,35 +727,45 @@ def main():
             return
         
         # Calculate period returns
-        if scramble_years:
-            print(f"\n=== Using Scrambled Years Method ===")
-            returns = calculate_scrambled_returns(data, duration_years, scramble_iteration)
+        if block_bootstrap:
+            print(f"\n=== Using Standard Bootstrap Method ===")
+            returns_array = calculate_scrambled_returns(data, duration_years, bootstrap_samples)
         else:
-            print(f"\n=== Using Sequential Years Method ===")
-            returns = calculate_period_returns(data, duration_years)
+            print(f"\n=== Using Moving Block Bootstrap Method ===")
+            returns_list = calculate_period_returns(data, duration_years)
+            # Convert to numpy array for consistency
+            returns_array = np.array([r['return'] for r in returns_list])
         
-        # Find best and worst periods
-        best_period = max(returns, key=lambda x: x['return'])
-        worst_period = min(returns, key=lambda x: x['return'])
-        
-        # Summary statistics
-        returns_array = np.array([r['return'] for r in returns])
+        # Summary statistics (work directly with numpy array)
         print(f"\n=== Summary Statistics ===")
-        print(f"Number of periods: {len(returns)}")
+        print(f"Number of periods: {len(returns_array):,}")
         print(f"Average return: {np.mean(returns_array)*100:.2f}%")
         print(f"Median return: {np.median(returns_array)*100:.2f}%")
         print(f"Min return: {np.min(returns_array)*100:.2f}%")
         print(f"Max return: {np.max(returns_array)*100:.2f}%")
         print(f"Std deviation: {np.std(returns_array)*100:.2f}%")
         
+        # Find best and worst periods (create minimal dicts for display)
+        max_idx = np.argmax(returns_array)
+        min_idx = np.argmin(returns_array)
+        
+        best_period = {
+            'start_date': None,
+            'end_date': None,
+            'return': float(returns_array[max_idx]),
+            'years': duration_years
+        }
+        worst_period = {
+            'start_date': None,
+            'end_date': None,
+            'return': float(returns_array[min_idx]),
+            'years': duration_years
+        }
+        
         print(f"\n=== Best Period ===")
-        if best_period['start_date'] is not None:
-            print(f"{best_period['start_date'].strftime('%Y-%m-%d')} to {best_period['end_date'].strftime('%Y-%m-%d')}")
         print(f"Return: {best_period['return']*100:+.2f}%")
         
         print(f"\n=== Worst Period ===")
-        if worst_period['start_date'] is not None:
-            print(f"{worst_period['start_date'].strftime('%Y-%m-%d')} to {worst_period['end_date'].strftime('%Y-%m-%d')}")
         print(f"Return: {worst_period['return']*100:+.2f}%")
         
         # Calculate overall period return
@@ -551,8 +779,11 @@ def main():
         print(f"Total return: {overall_total_return*100:+.2f}%")
         print(f"Annualized return: {overall_annualized_return*100:+.2f}%")
         
-        # Plot histogram
-        plot_returns_histogram(returns, duration_years, ticker, best_period, worst_period, overall_annualized_return, scramble_years, first_date, last_date)
+        # Plot histogram (pass numpy array directly)
+        plot_returns_histogram(returns_array, duration_years, ticker, best_period, worst_period, overall_annualized_return, block_bootstrap, first_date, last_date)
+        
+        # Show plot with execution time
+        show_plot_with_timer(program_start_time)
     else:
         print("\n✗ Failed to retrieve data")
 
