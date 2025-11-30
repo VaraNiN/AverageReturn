@@ -8,9 +8,9 @@ import matplotlib.pyplot as plt
 #ticker = "^GSPC"    # S&P 500 index (much longer, WARNING: does not include dividends)
 #ticker = "^SP500TR"  # S&P 500 index including reinvested dividends (total return)
 #ticker = "^GDAXI"   # DAX index including reinvested dividends (total return)
-ticker = "data/ftse_all_world_curvo.csv"  # CSV file (needs Date column + price column)
+ticker = "data/msci_world_curvo.csv"  # CSV file (needs Date column + price column)
 duration_years = 15 # Number of years for each return period
-plot_name = "FTSE All-World" # Optional; sets custom name in plot title when not empty
+plot_name = "" # Optional; sets custom name in plot title when not empty
 
 scramble_years = True # Pick random years (True: Standard Bootstrap) instead of sequential years (False: Block Bootstrap)
 scramble_iteration = 1e5  # Number of iterations for Standard Bootstrap
