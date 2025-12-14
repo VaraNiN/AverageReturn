@@ -624,6 +624,8 @@ def plot_returns_histogram(returns_array, duration_years, ticker, best_period, w
     
     # Calculate standard deviation and probability thresholds
     std_dev = np.std(returns_array)
+    skewness = (np.mean((returns_array - np.mean(returns_array))**3)) / (std_dev**3)
+    kurtosis = (np.mean((returns_array - np.mean(returns_array))**4)) / (std_dev**4) - 3  # Excess kurtosis
     
     # Calculate probabilities for user-defined thresholds
     prob_lines = ["\nProbabilities for:\n"]
@@ -666,14 +668,18 @@ def plot_returns_histogram(returns_array, duration_years, ticker, best_period, w
                    f'Worst Period:\n'
                    f'{worst_period["start_date"].strftime("%Y-%m-%d")} to {worst_period["end_date"].strftime("%Y-%m-%d")}\n'
                    f'Return: {worst_period["return"]*100:.2f}% p.a.\n\n'
-                   f'Standard Deviation: {std_dev:.2f}% p.a.\n\n' +
+                   f'Standard Deviation: {std_dev:.2f}% p.a.\n'
+                   f'Skewness: {skewness:.3f}\n'
+                   f'Excess Kurtosis: {kurtosis:.3f}\n\n' +
                    '\n'.join(prob_lines))
     else:
         textstr = (f'Best Period:\n'
                    f'Return: {best_period["return"]*100:.2f}% p.a.\n\n'
                    f'Worst Period:\n'
                    f'Return: {worst_period["return"]*100:.2f}% p.a.\n\n'
-                   f'Standard Deviation: {std_dev:.2f}% p.a.\n\n' +
+                   f'Standard Deviation: {std_dev:.2f}% p.a.\n'
+                   f'Skewness: {skewness:.3f}\n'
+                   f'Excess Kurtosis: {kurtosis:.3f}\n\n' +
                    '\n'.join(prob_lines))
     
     props = dict(boxstyle='round', facecolor='wheat', alpha=0.8)
